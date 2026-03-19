@@ -126,7 +126,18 @@ export default function Home() {
       <section className="mx-auto max-w-7xl px-4 pb-8 sm:px-6 lg:px-8">
         <div className="soft-pill footer-note rounded-[1.1rem] px-3.5 py-2 text-xs">
           <p className="font-medium text-slate-900">Veero - move stablecoins instantly onchain.</p>
-          <p className="mt-1 text-[11px] text-slate-500">Compact, fast, and built for confident payments.</p>
+          <p className="mt-1 text-[11px] text-slate-500">
+            Compact, fast, and built for confident payments. Built by{" "}
+            <a
+              href="https://x.com/wyckoffweb"
+              target="_blank"
+              rel="noreferrer"
+              className="font-medium text-slate-700 underline decoration-slate-300 underline-offset-4 transition hover:text-slate-900"
+            >
+              wyckoffweb
+            </a>
+            .
+          </p>
         </div>
       </section>
     </main>
