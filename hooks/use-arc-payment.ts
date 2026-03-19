@@ -1,0 +1,305 @@
+"use client";
+
+import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { parseUnits } from "viem";
+import {
+  useAccount,
+  useChainId,
+  useConnect,
+  useDisconnect,
+  useSwitchChain,
+  useWaitForTransactionReceipt,
+  useWriteContract,
+} from "wagmi";
+import { usePaymentHistory } from "@/hooks/use-payment-history";
+import { USDC_CONTRACT, usdcAbi } from "@/lib/payments";
+import type { PendingPayment, SendPaymentInput, TxStage } from "@/lib/payment-types";
+import { arcTestnet } from "@/lib/wagmi";
+
+function getErrorMessage(error: unknown, fallback: string) {
+  if (typeof error === "object" && error !== null) {
+    const maybeShortMessage = "shortMessage" in error ? error.shortMessage : undefined;
+
+    if (typeof maybeShortMessage === "string" && maybeShortMessage.length > 0) {
+      return maybeShortMessage;
+    }
+  }
+
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+
+  return fallback;
+}
+
+function isAlreadyConnectedError(error: unknown) {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return error.message.toLowerCase().includes("connector already connected");
+}
+
+export function useArcPayment() {
+  const queryClient = useQueryClient();
+  const { addEntry } = usePaymentHistory();
+  const { address, isConnected } = useAccount();
+  const chainId = useChainId();
+  const { connectAsync, connectors, isPending: isConnecting } = useConnect();
+  const { disconnectAsync } = useDisconnect();
+  const { switchChainAsync, isPending: isSwitching } = useSwitchChain();
+  const {
+    data: hash,
+    error: writeError,
+    isPending: isWriting,
+    writeContractAsync,
+  } = useWriteContract();
+  const { isLoading: isConfirming, isSuccess } = useWaitForTransactionReceipt({
+    hash,
+  });
+
+  const [activeProductId, setActiveProductId] = useState<string | null>(null);
+  const [successAmount, setSuccessAmount] = useState<string | null>(null);
+  const [successRecipient, setSuccessRecipient] = useState<`0x${string}` | null>(null);
+  const [successRecipientName, setSuccessRecipientName] = useState<string | null>(null);
+  const [successNote, setSuccessNote] = useState<string | null>(null);
+  const [txStage, setTxStage] = useState<TxStage>(null);
+  const [paymentError, setPaymentError] = useState<string | null>(null);
+  const [pendingPayment, setPendingPayment] = useState<PendingPayment>(null);
+  const lastStoredHashRef = useRef<`0x${string}` | null>(null);
+
+  const connector = useMemo(() => {
+    return (
+      connectors.find((item) => item.type === "injected") ??
+      connectors.find((item) => item.id === "injected") ??
+      connectors[0]
+    );
+  }, [connectors]);
+  const isWrongNetwork = isConnected && chainId !== arcTestnet.id;
+  const isSubmitting = isConnecting || isSwitching || isWriting || isConfirming;
+
+  useEffect(() => {
+    if (!isSuccess || !hash) {
+      return;
+    }
+
+    if (lastStoredHashRef.current !== hash && successAmount && successRecipient) {
+      addEntry({
+        id: `payment_${Date.now()}_${hash.slice(-6)}`,
+        timestamp: new Date().toISOString(),
+        amount: successAmount,
+        token: "USDC",
+        recipient: successRecipient,
+        recipientName: successRecipientName ?? undefined,
+        note: successNote ?? undefined,
+        transactionHash: hash,
+        status: "success",
+      });
+      lastStoredHashRef.current = hash;
+    }
+
+    setTxStage("success");
+    queryClient.invalidateQueries();
+  }, [
+    addEntry,
+    hash,
+    isSuccess,
+    queryClient,
+    successAmount,
+    successNote,
+    successRecipient,
+    successRecipientName,
+  ]);
+
+  useEffect(() => {
+    if (isConfirming && hash) {
+      setTxStage("confirming");
+      return;
+    }
+
+    if (isWriting && activeProductId) {
+      setTxStage("wallet");
+      return;
+    }
+
+    if ((isConnecting || isSwitching) && activeProductId) {
+      setTxStage("preparing");
+    }
+  }, [activeProductId, hash, isConfirming, isConnecting, isSwitching, isWriting]);
+
+  useEffect(() => {
+    if (!writeError) {
+      return;
+    }
+
+    setTxStage(null);
+    setPaymentError(getErrorMessage(writeError, "Payment failed."));
+    setPendingPayment(null);
+  }, [writeError]);
+
+  useEffect(() => {
+    if (
+      !pendingPayment ||
+      !isConnected ||
+      chainId !== arcTestnet.id ||
+      !address ||
+      isWriting ||
+      isConfirming
+    ) {
+      return;
+    }
+
+    void submitPayment(pendingPayment, address);
+  }, [address, chainId, isConfirming, isConnected, isWriting, pendingPayment]);
+
+  const explorerHref = useMemo(() => {
+    if (!hash) {
+      return null;
+    }
+
+    return `${arcTestnet.blockExplorers.default.url}/tx/${hash}`;
+  }, [hash]);
+
+  const shortHash = useMemo(() => {
+    if (!hash) {
+      return null;
+    }
+
+    return `${hash.slice(0, 6)}...${hash.slice(-4)}`;
+  }, [hash]);
+
+  const showSuccessOverlay = Boolean(isSuccess && hash && successAmount);
+  const statusLabel =
+    txStage === "preparing"
+      ? "Preparing payment..."
+      : txStage === "wallet"
+        ? "Waiting for wallet confirmation..."
+        : txStage === "confirming"
+          ? "Sending on Arc..."
+          : txStage === "success"
+            ? "Done"
+            : null;
+
+  async function submitPayment(input: SendPaymentInput, accountAddress: `0x${string}`) {
+    setPendingPayment(null);
+    setActiveProductId("send-payment");
+    setSuccessAmount(input.amount);
+    setSuccessRecipient(input.recipient);
+    setSuccessRecipientName(input.recipientName ?? null);
+    setSuccessNote(input.note ?? null);
+    setTxStage("wallet");
+
+    const submittedHash = await writeContractAsync({
+      address: USDC_CONTRACT,
+      abi: usdcAbi,
+      functionName: "transfer",
+      args: [input.recipient, parseUnits(input.amount, arcTestnet.nativeCurrency.decimals)],
+      chainId: arcTestnet.id,
+      account: accountAddress,
+    });
+
+    if (submittedHash) {
+      setTxStage("confirming");
+    }
+  }
+
+  async function handlePay(input: SendPaymentInput) {
+    setSuccessAmount(null);
+    setSuccessRecipient(null);
+    setSuccessRecipientName(null);
+    setSuccessNote(null);
+    setTxStage(null);
+    setPaymentError(null);
+    setActiveProductId("send-payment");
+    setPendingPayment(input);
+
+    try {
+      let accountAddress = address;
+      let currentChainId = chainId;
+
+      if (!isConnected) {
+        setTxStage("preparing");
+
+        if (!connector) {
+          throw new Error("No wallet was found. Open a browser wallet and try again.");
+        }
+
+        try {
+          const connected = await connectAsync({ connector });
+          accountAddress = connected.accounts[0];
+          currentChainId = connected.chainId;
+        } catch (connectError) {
+          if (!isAlreadyConnectedError(connectError)) {
+            throw connectError;
+          }
+
+          await disconnectAsync();
+
+          const connected = await connectAsync({ connector });
+          accountAddress = connected.accounts[0];
+          currentChainId = connected.chainId;
+        }
+      }
+
+      if (currentChainId !== arcTestnet.id) {
+        setTxStage("preparing");
+        await switchChainAsync({ chainId: arcTestnet.id });
+        return;
+      }
+
+      if (!accountAddress) {
+        throw new Error("Wallet address unavailable. Reconnect and try again.");
+      }
+
+      await submitPayment(input, accountAddress);
+    } catch (error) {
+      setTxStage(null);
+      setPendingPayment(null);
+
+      const message = getErrorMessage(
+        error,
+        "Something interrupted the payment before it could complete.",
+      );
+
+      if (!/user rejected|rejected the request|denied/i.test(message)) {
+        setPaymentError(message);
+      }
+    }
+  }
+
+  function resetSuccessState() {
+    setActiveProductId(null);
+    setSuccessAmount(null);
+    setSuccessRecipient(null);
+    setSuccessRecipientName(null);
+    setSuccessNote(null);
+    setTxStage(null);
+    setPaymentError(null);
+    setPendingPayment(null);
+  }
+
+  function clearPaymentError() {
+    setPaymentError(null);
+  }
+
+  return {
+    activeProductId,
+    clearPaymentError,
+    explorerHref,
+    handlePay,
+    isConnected,
+    isSubmitting,
+    isWrongNetwork,
+    paymentError,
+    resetSuccessState,
+    shortHash,
+    showSuccessOverlay,
+    successNote,
+    successRecipientName,
+    statusLabel,
+    successAmount,
+    successRecipient,
+    txStage,
+  };
+}
