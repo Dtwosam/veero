@@ -4,6 +4,7 @@ import { NetworkStatusCard } from "@/components/network-status-card";
 import { PayflowSection } from "@/components/payflow-section";
 import { PaymentHistorySection } from "@/components/payment-history-section";
 import { QuickLinkCard } from "@/components/quick-link-card";
+import { VeeroInsightsSection } from "@/components/veero-insights-section";
 
 const links = [
   {
@@ -79,6 +80,7 @@ export default function Home() {
 
           <aside className="space-y-3">
             <PaymentHistorySection />
+            <VeeroInsightsSection />
             <NetworkStatusCard />
 
             <section className="section-frame fade-up-soft overflow-hidden rounded-[1.1rem] p-3">
