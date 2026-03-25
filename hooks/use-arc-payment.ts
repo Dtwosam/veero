@@ -2,20 +2,26 @@
 
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { parseUnits } from "viem";
+import { parseGwei, parseUnits } from "viem";
 import {
   useAccount,
   useChainId,
   useConnect,
   useDisconnect,
+  usePublicClient,
   useSwitchChain,
   useWaitForTransactionReceipt,
   useWriteContract,
 } from "wagmi";
 import { usePaymentHistory } from "@/hooks/use-payment-history";
+import { useRecentRecipients } from "@/hooks/use-recent-recipients";
 import { USDC_CONTRACT, usdcAbi } from "@/lib/payments";
 import type { PendingPayment, SendPaymentInput, TxStage } from "@/lib/payment-types";
 import { arcTestnet } from "@/lib/wagmi";
+
+const ARC_MIN_BASE_FEE = parseGwei("160");
+const ARC_DEFAULT_PRIORITY_FEE = parseGwei("10");
+const ARC_DEFAULT_MAX_FEE = parseGwei("330");
 
 function getErrorMessage(error: unknown, fallback: string) {
   if (typeof error === "object" && error !== null) {
@@ -44,19 +50,21 @@ function isAlreadyConnectedError(error: unknown) {
 export function useArcPayment() {
   const queryClient = useQueryClient();
   const { addEntry } = usePaymentHistory();
+  const { saveRecentRecipient } = useRecentRecipients();
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
+  const publicClient = usePublicClient({ chainId: arcTestnet.id });
   const { connectAsync, connectors, isPending: isConnecting } = useConnect();
   const { disconnectAsync } = useDisconnect();
   const { switchChainAsync, isPending: isSwitching } = useSwitchChain();
   const {
-    data: hash,
     error: writeError,
     isPending: isWriting,
     writeContractAsync,
   } = useWriteContract();
+  const [submittedHash, setSubmittedHash] = useState<`0x${string}` | null>(null);
   const { isLoading: isConfirming, isSuccess } = useWaitForTransactionReceipt({
-    hash,
+    hash: submittedHash ?? undefined,
   });
 
   const [activeProductId, setActiveProductId] = useState<string | null>(null);
@@ -67,6 +75,7 @@ export function useArcPayment() {
   const [txStage, setTxStage] = useState<TxStage>(null);
   const [paymentError, setPaymentError] = useState<string | null>(null);
   const [pendingPayment, setPendingPayment] = useState<PendingPayment>(null);
+  const [submittedAt, setSubmittedAt] = useState<number | null>(null);
   const lastStoredHashRef = useRef<`0x${string}` | null>(null);
 
   const connector = useMemo(() => {
@@ -80,40 +89,45 @@ export function useArcPayment() {
   const isSubmitting = isConnecting || isSwitching || isWriting || isConfirming;
 
   useEffect(() => {
-    if (!isSuccess || !hash) {
+    if (!isSuccess || !submittedHash) {
       return;
     }
 
-    if (lastStoredHashRef.current !== hash && successAmount && successRecipient) {
+    if (lastStoredHashRef.current !== submittedHash && successAmount && successRecipient) {
       addEntry({
-        id: `payment_${Date.now()}_${hash.slice(-6)}`,
+        id: `payment_${Date.now()}_${submittedHash.slice(-6)}`,
         timestamp: new Date().toISOString(),
         amount: successAmount,
         token: "USDC",
         recipient: successRecipient,
         recipientName: successRecipientName ?? undefined,
         note: successNote ?? undefined,
-        transactionHash: hash,
+        transactionHash: submittedHash,
         status: "success",
       });
-      lastStoredHashRef.current = hash;
+      saveRecentRecipient({
+        address: successRecipient,
+        label: successRecipientName ?? undefined,
+      });
+      lastStoredHashRef.current = submittedHash;
     }
 
     setTxStage("success");
     queryClient.invalidateQueries();
   }, [
     addEntry,
-    hash,
     isSuccess,
     queryClient,
+    submittedHash,
     successAmount,
     successNote,
     successRecipient,
     successRecipientName,
+    saveRecentRecipient,
   ]);
 
   useEffect(() => {
-    if (isConfirming && hash) {
+    if (isConfirming && submittedHash) {
       setTxStage("confirming");
       return;
     }
@@ -126,17 +140,32 @@ export function useArcPayment() {
     if ((isConnecting || isSwitching) && activeProductId) {
       setTxStage("preparing");
     }
-  }, [activeProductId, hash, isConfirming, isConnecting, isSwitching, isWriting]);
+  }, [activeProductId, isConfirming, isConnecting, isSwitching, isWriting, submittedHash]);
 
   useEffect(() => {
     if (!writeError) {
       return;
     }
 
-    setTxStage(null);
+    setTxStage("failed");
     setPaymentError(getErrorMessage(writeError, "Payment failed."));
     setPendingPayment(null);
   }, [writeError]);
+
+  useEffect(() => {
+    if (txStage !== "confirming" || !submittedHash || submittedAt === null) {
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      setTxStage("failed");
+      setPaymentError(
+        "Arc did not confirm this transaction in time. It may have been dropped before reaching the network.",
+      );
+    }, 90_000);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [submittedAt, submittedHash, txStage]);
 
   useEffect(() => {
     if (
@@ -154,22 +183,26 @@ export function useArcPayment() {
   }, [address, chainId, isConfirming, isConnected, isWriting, pendingPayment]);
 
   const explorerHref = useMemo(() => {
-    if (!hash) {
+    if (!submittedHash) {
       return null;
     }
 
-    return `${arcTestnet.blockExplorers.default.url}/tx/${hash}`;
-  }, [hash]);
+    return `${arcTestnet.blockExplorers.default.url}/tx/${submittedHash}`;
+  }, [submittedHash]);
 
   const shortHash = useMemo(() => {
-    if (!hash) {
+    if (!submittedHash) {
       return null;
     }
 
-    return `${hash.slice(0, 6)}...${hash.slice(-4)}`;
-  }, [hash]);
+    return `${submittedHash.slice(0, 6)}...${submittedHash.slice(-4)}`;
+  }, [submittedHash]);
 
-  const showSuccessOverlay = Boolean(isSuccess && hash && successAmount);
+  const showSuccessOverlay = Boolean(isSuccess && submittedHash && successAmount);
+  const isConfirmationDelayed =
+    txStage === "confirming" &&
+    submittedAt !== null &&
+    Date.now() - submittedAt > 45_000;
   const statusLabel =
     txStage === "preparing"
       ? "Preparing payment..."
@@ -178,7 +211,9 @@ export function useArcPayment() {
         : txStage === "confirming"
           ? "Sending on Arc..."
           : txStage === "success"
-            ? "Done"
+            ? "Confirmed"
+            : txStage === "failed"
+              ? "Failed"
             : null;
 
   async function submitPayment(input: SendPaymentInput, accountAddress: `0x${string}`) {
@@ -188,18 +223,36 @@ export function useArcPayment() {
     setSuccessRecipient(input.recipient);
     setSuccessRecipientName(input.recipientName ?? null);
     setSuccessNote(input.note ?? null);
+    setSubmittedHash(null);
     setTxStage("wallet");
 
-    const submittedHash = await writeContractAsync({
+    const estimatedFees = await publicClient?.estimateFeesPerGas();
+    const estimatedMaxFee = estimatedFees?.maxFeePerGas ?? estimatedFees?.gasPrice;
+    const estimatedPriorityFee =
+      estimatedFees?.maxPriorityFeePerGas ?? ARC_DEFAULT_PRIORITY_FEE;
+    const maxFeePerGas =
+      estimatedMaxFee && estimatedMaxFee > ARC_MIN_BASE_FEE
+        ? estimatedMaxFee
+        : ARC_DEFAULT_MAX_FEE;
+    const maxPriorityFeePerGas =
+      estimatedPriorityFee > ARC_DEFAULT_PRIORITY_FEE
+        ? estimatedPriorityFee
+        : ARC_DEFAULT_PRIORITY_FEE;
+
+    const nextSubmittedHash = await writeContractAsync({
       address: USDC_CONTRACT,
       abi: usdcAbi,
       functionName: "transfer",
       args: [input.recipient, parseUnits(input.amount, arcTestnet.nativeCurrency.decimals)],
       chainId: arcTestnet.id,
       account: accountAddress,
+      maxFeePerGas,
+      maxPriorityFeePerGas,
     });
 
-    if (submittedHash) {
+    if (nextSubmittedHash) {
+      setSubmittedHash(nextSubmittedHash);
+      setSubmittedAt(Date.now());
       setTxStage("confirming");
     }
   }
@@ -209,10 +262,12 @@ export function useArcPayment() {
     setSuccessRecipient(null);
     setSuccessRecipientName(null);
     setSuccessNote(null);
+    setSubmittedHash(null);
+    setSubmittedAt(null);
     setTxStage(null);
     setPaymentError(null);
     setActiveProductId("send-payment");
-    setPendingPayment(input);
+    setPendingPayment(null);
 
     try {
       let accountAddress = address;
@@ -244,6 +299,7 @@ export function useArcPayment() {
 
       if (currentChainId !== arcTestnet.id) {
         setTxStage("preparing");
+        setPendingPayment(input);
         await switchChainAsync({ chainId: arcTestnet.id });
         return;
       }
@@ -254,7 +310,7 @@ export function useArcPayment() {
 
       await submitPayment(input, accountAddress);
     } catch (error) {
-      setTxStage(null);
+      setTxStage("failed");
       setPendingPayment(null);
 
       const message = getErrorMessage(
@@ -274,9 +330,12 @@ export function useArcPayment() {
     setSuccessRecipient(null);
     setSuccessRecipientName(null);
     setSuccessNote(null);
+    setSubmittedHash(null);
+    setSubmittedAt(null);
     setTxStage(null);
     setPaymentError(null);
     setPendingPayment(null);
+    lastStoredHashRef.current = null;
   }
 
   function clearPaymentError() {
@@ -295,11 +354,13 @@ export function useArcPayment() {
     resetSuccessState,
     shortHash,
     showSuccessOverlay,
+    submittedHash,
     successNote,
     successRecipientName,
     statusLabel,
     successAmount,
     successRecipient,
+    isConfirmationDelayed,
     txStage,
   };
 }

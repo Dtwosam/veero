@@ -1,6 +1,6 @@
 "use client";
 
-import { createConfig, http } from "wagmi";
+import { createConfig, fallback, http } from "wagmi";
 import { injected } from "wagmi/connectors";
 import type { Chain } from "viem";
 
@@ -14,7 +14,12 @@ export const arcTestnet = {
   },
   rpcUrls: {
     default: {
-      http: ["https://rpc.testnet.arc.network"],
+      http: [
+        "https://rpc.testnet.arc.network",
+        "https://rpc.blockdaemon.testnet.arc.network",
+        "https://rpc.drpc.testnet.arc.network",
+        "https://rpc.quicknode.testnet.arc.network",
+      ],
     },
   },
   blockExplorers: {
@@ -34,7 +39,10 @@ export const config = createConfig({
     }),
   ],
   transports: {
-    [arcTestnet.id]: http(arcTestnet.rpcUrls.default.http[0]),
+    [arcTestnet.id]: fallback(
+      arcTestnet.rpcUrls.default.http.map((url) => http(url)),
+      { retryCount: 1 },
+    ),
   },
   ssr: true,
 });

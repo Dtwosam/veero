@@ -1,139 +1,105 @@
 "use client";
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { usePaymentHistory } from "@/hooks/use-payment-history";
-import { arcTestnet } from "@/lib/wagmi";
 
 function shortAddress(address: string) {
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
 
-function shortHash(hash: string) {
-  return `${hash.slice(0, 6)}...${hash.slice(-4)}`;
-}
-
-function formatTimestamp(timestamp: string) {
+function formatRelativeTime(timestamp: string, now: number) {
   const date = new Date(timestamp);
+  const diffMs = now - date.getTime();
 
-  if (Number.isNaN(date.getTime())) {
-    return "Recently";
+  if (Number.isNaN(date.getTime()) || diffMs < 0) {
+    return "now";
   }
 
-  return new Intl.DateTimeFormat("en-US", {
-    dateStyle: "medium",
-    timeStyle: "short",
-  }).format(date);
+  const minute = 60_000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+
+  if (diffMs < minute) {
+    return "now";
+  }
+
+  if (diffMs < hour) {
+    return `${Math.floor(diffMs / minute)}m ago`;
+  }
+
+  if (diffMs < day) {
+    return `${Math.floor(diffMs / hour)}h ago`;
+  }
+
+  return `${Math.floor(diffMs / day)}d ago`;
 }
 
 export function PaymentHistorySection() {
   const { history, isReady } = usePaymentHistory();
+  const [now, setNow] = useState(() => Date.now());
 
-  const items = useMemo(() => history.slice(0, 12), [history]);
+  useEffect(() => {
+    const intervalId = window.setInterval(() => setNow(Date.now()), 60_000);
+    return () => window.clearInterval(intervalId);
+  }, []);
+
+  const items = useMemo(() => history.slice(0, 20), [history]);
 
   return (
-    <section id="activity" className="section-frame history-surface fade-up-soft stagger-2 overflow-hidden rounded-[1.45rem] p-3.5 sm:p-4">
-      <div className="absolute inset-x-0 top-0 h-20 bg-gradient-to-r from-cyan/16 via-violet/14 to-coral/14" />
-      <div className="absolute -left-8 top-8 h-24 w-24 rounded-full bg-aqua/16 blur-3xl" />
-      <div className="absolute bottom-0 right-0 h-32 w-32 rounded-full bg-blush/14 blur-3xl" />
-
-      <div className="relative z-10">
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-          <div>
-            <p className="section-kicker text-cyan">Activity</p>
-            <h2 className="section-title mt-2 text-[1.2rem] text-slate-900 sm:text-[1.35rem]">
-              Activity
-            </h2>
-          </div>
+    <section id="activity" className="section-frame rounded-[1rem] p-2.5">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <p className="section-kicker text-cyan">Activity</p>
+          <h2 className="mt-1 text-[1rem] font-semibold tracking-[-0.04em] text-slate-900">
+            Activity
+          </h2>
         </div>
+        <p className="text-[11px] text-slate-400">Recent payments</p>
+      </div>
 
-        {!isReady ? (
-          <div className="history-empty mt-3 rounded-[1.2rem] p-3.5 sm:p-4">
-            <div>
-              <p className="text-base font-semibold text-slate-900">Getting Veero ready...</p>
-              <p className="mt-2 max-w-md text-sm leading-6 text-slate-600">
-                Loading activity...
-              </p>
-            </div>
-          </div>
-        ) : null}
+      {!isReady ? (
+        <div className="timeline-shell mt-2">
+          <p className="text-[12px] text-slate-500">Loading activity...</p>
+        </div>
+      ) : null}
 
-        {isReady && items.length === 0 ? (
-          <div className="history-empty mt-3 rounded-[1.2rem] p-3.5 sm:p-4">
-            <div className="history-empty-illustration">
-              <span className="history-empty-orb history-empty-orb-a" />
-              <span className="history-empty-orb history-empty-orb-b" />
-            </div>
-            <div>
-              <p className="text-base font-semibold text-slate-900">No activity yet</p>
-              <p className="mt-2 max-w-md text-sm leading-6 text-slate-600">
-                Payments you send through Veero will show up here.
-              </p>
-            </div>
-          </div>
-        ) : null}
+      {isReady && items.length === 0 ? (
+        <div className="timeline-shell mt-2">
+          <p className="text-sm font-medium text-slate-900">No activity yet</p>
+          <p className="mt-1 text-[12px] text-slate-500">
+            Payments you send through Veero will appear here.
+          </p>
+        </div>
+      ) : null}
 
-        {items.length > 0 ? (
-          <div className="mt-3 space-y-2">
+      {items.length > 0 ? (
+        <div className="timeline-shell mt-2">
+          <div className="timeline-list">
             {items.map((item) => (
-              <article key={item.id} className="history-item rounded-[1rem] p-3 sm:p-3.5">
-                <div className="flex flex-col gap-2.5 sm:flex-row sm:items-start sm:justify-between">
-                  <div className="min-w-0 flex-1">
-                    <div className="flex items-start gap-3">
-                      <div className="min-w-0">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <p className="truncate text-sm font-semibold text-slate-900">
-                            {item.recipientName || shortAddress(item.recipient)}
-                          </p>
-                        </div>
-                        <p className="mt-1 text-[11px] text-slate-400">{item.recipient}</p>
-                        {item.note ? (
-                          <div className="mt-2 rounded-[0.75rem] bg-slate-50/80 px-2.5 py-1.5">
-                            <p className="meta-label">Note</p>
-                            <p className="mt-1.5 text-[13px] leading-5 text-slate-600">{item.note}</p>
-                          </div>
-                        ) : null}
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="history-amount-shell">
-                    <p className="history-amount-value">{item.amount} {item.token}</p>
+              <article key={item.id} className="timeline-row">
+                <div className="min-w-0">
+                  <p className="truncate text-[13px] font-semibold text-slate-900">
+                    {item.recipientName || shortAddress(item.recipient)}
+                  </p>
+                  <div className="mt-0.5 flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
+                    <span>{formatRelativeTime(item.timestamp, now)}</span>
+                    {item.note ? <span>- {item.note}</span> : null}
                   </div>
                 </div>
-
-                <div className="history-meta-grid mt-2.5">
-                  <div className="history-meta-card">
-                    <p className="meta-label">Time</p>
-                    <p className="mt-2 text-[13px] font-medium text-slate-700">
-                      {formatTimestamp(item.timestamp)}
-                    </p>
-                  </div>
-                  <div className="history-meta-card">
-                    <p className="meta-label">Transaction</p>
-                    <div className="mt-1.5 flex flex-wrap items-center gap-2.5">
-                      <p className="text-[13px] font-medium text-slate-700">
-                        {shortHash(item.transactionHash)}
-                      </p>
-                      <a
-                        href={`${arcTestnet.blockExplorers.default.url}/tx/${item.transactionHash}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="history-link"
-                      >
-                        View tx
-                      </a>
-                    </div>
-                  </div>
+                <div className="text-right">
+                  <p className="text-[13px] font-semibold text-slate-900">
+                    {item.amount} {item.token}
+                  </p>
                 </div>
               </article>
             ))}
           </div>
-        ) : null}
+        </div>
+      ) : null}
 
-        <p className="mt-3 text-[11px] text-slate-500">
-          Only payments made in Veero are stored here.
-        </p>
-      </div>
+      <p className="mt-2 text-[11px] text-slate-400">
+        Only payments sent through Veero are stored here.
+      </p>
     </section>
   );
 }

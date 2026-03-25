@@ -1,72 +1,100 @@
 "use client";
 
-import { useMemo, useState } from "react";
-import { formatUnits, isAddress, parseUnits } from "viem";
-import { useAccount, useChainId, useReadContracts } from "wagmi";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { isAddress } from "viem";
+import { useAccount } from "wagmi";
 import { useArcPayment } from "@/hooks/use-arc-payment";
+import { usePaymentDraft } from "@/hooks/use-payment-draft";
+import { usePaymentHistory } from "@/hooks/use-payment-history";
+import { useRecentRecipients } from "@/hooks/use-recent-recipients";
 import { useSavedContacts } from "@/hooks/use-saved-contacts";
+import { getNoteSuggestion } from "@/lib/note-suggestions";
 import type { SavedContact } from "@/lib/payment-types";
-import { USDC_CONTRACT, usdcAbi } from "@/lib/payments";
 import { arcTestnet } from "@/lib/wagmi";
-
-type FormErrors = {
-  amount?: string;
-  contactAddress?: string;
-  contactName?: string;
-  recipient?: string;
-};
 
 const CONTACT_EMOJI_OPTIONS = [
   "\u{1F642}",
+  "\u{1F680}",
   "\u{1F4B8}",
-  "\u2728",
-  "\u{1F7E2}",
-  "\u{1F9E1}",
-  "\u{1F30A}",
+  "\u{1F4BC}",
+  "\u{1F4BB}",
+  "\u{1F3AF}",
 ];
 
-function createContactId() {
-  return `contact_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-}
+type FormState = {
+  amount: string;
+  note: string;
+  recipient: string;
+};
 
-function formatUsdcBalance(balance?: bigint, decimals?: number) {
-  if (balance === undefined || decimals === undefined) {
-    return "--";
-  }
+const EMPTY_FORM: FormState = {
+  amount: "",
+  note: "",
+  recipient: "",
+};
 
-  const formatted = Number(formatUnits(balance, decimals));
-
-  return new Intl.NumberFormat("en-US", {
-    maximumFractionDigits: formatted >= 1000 ? 2 : 4,
-    minimumFractionDigits: 0,
-  }).format(formatted);
-}
-
-function shortAddress(address?: string | null) {
-  if (!address) {
-    return "--";
-  }
-
+function shortAddress(address: string) {
   return `${address.slice(0, 6)}...${address.slice(-4)}`;
 }
 
-export function PayflowSection() {
-  const { address, isConnected } = useAccount();
-  const chainId = useChainId();
-  const isArcTestnet = chainId === arcTestnet.id;
-  const [recipient, setRecipient] = useState("");
-  const [amount, setAmount] = useState("");
-  const [note, setNote] = useState("");
-  const [step, setStep] = useState<"form" | "review">("form");
-  const [hasTriedReview, setHasTriedReview] = useState(false);
-  const [hasTouchedRecipient, setHasTouchedRecipient] = useState(false);
-  const [hasTouchedAmount, setHasTouchedAmount] = useState(false);
-  const [isContactEditorOpen, setIsContactEditorOpen] = useState(false);
-  const [editingContactId, setEditingContactId] = useState<string | null>(null);
-  const [contactName, setContactName] = useState("");
-  const [contactAddress, setContactAddress] = useState("");
-  const [contactEmoji, setContactEmoji] = useState(CONTACT_EMOJI_OPTIONS[0]);
+function normalizeAmount(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return "";
+  }
 
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed)) {
+    return trimmed;
+  }
+
+  return parsed.toString();
+}
+
+function getStatusClasses(txStage: ReturnType<typeof useArcPayment>["txStage"]) {
+  if (txStage === "preparing") {
+    return {
+      dotClass: "payflow-status-dot payflow-status-dot-preparing",
+      shellClass: "payflow-inline-state payflow-inline-preparing",
+    };
+  }
+
+  if (txStage === "wallet") {
+    return {
+      dotClass: "payflow-status-dot payflow-status-dot-wallet",
+      shellClass: "payflow-inline-state payflow-inline-wallet",
+    };
+  }
+
+  if (txStage === "confirming") {
+    return {
+      dotClass: "payflow-status-dot payflow-status-dot-confirming",
+      shellClass: "payflow-inline-state payflow-inline-confirming",
+    };
+  }
+
+  if (txStage === "success") {
+    return {
+      dotClass: "payflow-status-dot payflow-status-dot-success",
+      shellClass: "payflow-inline-state payflow-inline-success",
+    };
+  }
+
+  if (txStage === "failed") {
+    return {
+      dotClass: "payflow-status-dot payflow-status-dot-failed",
+      shellClass: "payflow-inline-state payflow-inline-failed",
+    };
+  }
+
+  return {
+    dotClass: "payflow-status-dot",
+    shellClass: "payflow-inline-state payflow-inline-idle",
+  };
+}
+
+export function PayflowSection() {
+  const { address: connectedAddress } = useAccount();
   const {
     activeProductId,
     clearPaymentError,
@@ -78,809 +106,782 @@ export function PayflowSection() {
     resetSuccessState,
     shortHash,
     showSuccessOverlay,
+    submittedHash,
     statusLabel,
     successAmount,
     successNote,
     successRecipient,
     successRecipientName,
+    isConfirmationDelayed,
     txStage,
   } = useArcPayment();
-  const {
-    contacts,
-    hasDuplicateAddress,
-    isReady: areContactsReady,
-    removeContact,
-    saveContact,
-  } = useSavedContacts();
+  const { contacts, hasDuplicateAddress, isReady: contactsReady, removeContact, saveContact } =
+    useSavedContacts();
+  const { hasRecipient, isReady: recentsReady, recipients } = useRecentRecipients();
+  const { draft, hasDraft, isReady: draftReady, clearDraft, saveDraft } = usePaymentDraft();
+  const { history } = usePaymentHistory();
 
-  const shouldReadBalance = Boolean(address) && isArcTestnet;
-  const selectedContact = useMemo(
-    () =>
-      contacts.find(
-        (contact) => contact.address.toLowerCase() === recipient.trim().toLowerCase(),
-      ) ?? null,
-    [contacts, recipient],
-  );
-
-  const { data: usdcReads } = useReadContracts({
-    allowFailure: false,
-    contracts: shouldReadBalance
-      ? [
-          {
-            address: USDC_CONTRACT,
-            abi: usdcAbi,
-            functionName: "balanceOf",
-            args: [address!],
-            chainId: arcTestnet.id,
-          },
-          {
-            address: USDC_CONTRACT,
-            abi: usdcAbi,
-            functionName: "decimals",
-            chainId: arcTestnet.id,
-          },
-        ]
-      : [],
-    query: {
-      enabled: shouldReadBalance,
-      refetchInterval: 15000,
-    },
+  const [formState, setFormState] = useState<FormState>(EMPTY_FORM);
+  const [recipientName, setRecipientName] = useState("");
+  const [draftPromptVisible, setDraftPromptVisible] = useState(false);
+  const [reviewMode, setReviewMode] = useState(false);
+  const [submittedOnce, setSubmittedOnce] = useState(false);
+  const [touchedFields, setTouchedFields] = useState<Record<keyof FormState, boolean>>({
+    amount: false,
+    note: false,
+    recipient: false,
   });
+  const [contactName, setContactName] = useState("");
+  const [contactAddress, setContactAddress] = useState("");
+  const [contactEmoji, setContactEmoji] = useState(CONTACT_EMOJI_OPTIONS[0]);
+  const [editingContactId, setEditingContactId] = useState<string | null>(null);
+  const [contactError, setContactError] = useState<string | null>(null);
+  const [noteSuggestion, setNoteSuggestion] = useState<string | null>(null);
+  const [noteSuggestionLoading, setNoteSuggestionLoading] = useState(false);
+  const draftHydratedRef = useRef(false);
+  const skipNextDraftSaveRef = useRef(true);
 
-  const availableBalance = usdcReads?.[0];
-  const usdcDecimals = usdcReads?.[1];
-  const estimatedRemainingBalance = useMemo(() => {
-    if (!amount.trim() || availableBalance === undefined || usdcDecimals === undefined) {
-      return null;
-    }
-
-    try {
-      const parsedAmount = parseUnits(amount.trim(), usdcDecimals);
-
-      if (parsedAmount > availableBalance) {
-        return null;
-      }
-
-      return availableBalance - parsedAmount;
-    } catch {
-      return null;
-    }
-  }, [amount, availableBalance, usdcDecimals]);
-
-  const errors = useMemo<FormErrors>(() => {
-    const nextErrors: FormErrors = {};
-    const trimmedRecipient = recipient.trim();
-    const trimmedAmount = amount.trim();
-
-    if (!trimmedRecipient) {
-      nextErrors.recipient = "That wallet address doesn't look right. Double-check it and try again.";
-    } else if (!isAddress(trimmedRecipient)) {
-      nextErrors.recipient = "That wallet address doesn't look right. Double-check it and try again.";
-    } else if (address && trimmedRecipient.toLowerCase() === address.toLowerCase()) {
-      nextErrors.recipient = "You can't send a payment to your own wallet here.";
-    }
-
-    if (!trimmedAmount) {
-      nextErrors.amount = "Enter an amount to continue.";
-    } else {
-      const numericAmount = Number(trimmedAmount);
-
-      if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
-        nextErrors.amount = "Enter a valid amount greater than zero.";
-      } else if (availableBalance !== undefined && usdcDecimals !== undefined) {
-        try {
-          const parsedAmount = parseUnits(trimmedAmount, usdcDecimals);
-
-          if (parsedAmount > availableBalance) {
-            nextErrors.amount = "You don't have enough USDC for this payment.";
-          }
-        } catch {
-          nextErrors.amount = "Enter a valid amount greater than zero.";
-        }
-      }
-    }
-
-    if (isContactEditorOpen) {
-      const trimmedContactName = contactName.trim();
-      const trimmedContactAddress = contactAddress.trim();
-
-      if (!trimmedContactName) {
-        nextErrors.contactName = "Add a name for this contact.";
-      }
-
-      if (!trimmedContactAddress) {
-        nextErrors.contactAddress = "Enter a valid wallet address to save this contact.";
-      } else if (!isAddress(trimmedContactAddress)) {
-        nextErrors.contactAddress = "Enter a valid wallet address to save this contact.";
-      } else if (hasDuplicateAddress(trimmedContactAddress, editingContactId ?? undefined)) {
-        nextErrors.contactAddress = "That address is already saved.";
-      }
-    }
-
-    return nextErrors;
-  }, [
-    amount,
-    availableBalance,
-    contactAddress,
-    contactName,
-    editingContactId,
-    hasDuplicateAddress,
-    isContactEditorOpen,
-    recipient,
-    usdcDecimals,
-  ]);
-
-  const hasErrors = Boolean(errors.amount || errors.recipient);
-  const reviewDisabled =
-    isSubmitting ||
-    hasErrors ||
-    !isConnected ||
-    isWrongNetwork ||
-    !recipient.trim() ||
-    !amount.trim();
-  const showPendingState =
-    activeProductId === "send-payment" &&
-    (txStage === "preparing" || txStage === "wallet" || txStage === "confirming");
-
-  function handleReview() {
-    setHasTriedReview(true);
-
-    if (reviewDisabled) {
+  useEffect(() => {
+    if (!draftReady || draftHydratedRef.current) {
       return;
     }
 
-    setStep("review");
+    draftHydratedRef.current = true;
+
+    if (hasDraft && !formState.recipient && !formState.amount && !formState.note) {
+      setDraftPromptVisible(true);
+    }
+  }, [draftReady, formState.amount, formState.note, formState.recipient, hasDraft]);
+
+  useEffect(() => {
+    if (!draftReady) {
+      return;
+    }
+
+    if (skipNextDraftSaveRef.current) {
+      skipNextDraftSaveRef.current = false;
+      return;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      const nextDraft = {
+        amount: formState.amount.trim(),
+        note: formState.note.trim(),
+        recipient: formState.recipient.trim(),
+      };
+
+      if (!nextDraft.amount && !nextDraft.note && !nextDraft.recipient) {
+        clearDraft();
+        return;
+      }
+
+      saveDraft(nextDraft);
+    }, 240);
+
+    return () => window.clearTimeout(timeoutId);
+  }, [clearDraft, draftReady, formState.amount, formState.note, formState.recipient, saveDraft]);
+
+  useEffect(() => {
+    const trimmedNote = formState.note.trim();
+    if (!trimmedNote) {
+      setNoteSuggestion(null);
+      setNoteSuggestionLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setNoteSuggestionLoading(true);
+
+    const timeoutId = window.setTimeout(() => {
+      void getNoteSuggestion(trimmedNote, formState.recipient.trim(), formState.amount.trim())
+        .then((suggestion) => {
+          if (!cancelled) {
+            setNoteSuggestion(suggestion);
+          }
+        })
+        .finally(() => {
+          if (!cancelled) {
+            setNoteSuggestionLoading(false);
+          }
+        });
+    }, 180);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+    };
+  }, [formState.amount, formState.note, formState.recipient]);
+
+  useEffect(() => {
+    if (!showSuccessOverlay) {
+      return;
+    }
+
+    setFormState(EMPTY_FORM);
+    setRecipientName("");
+    setReviewMode(false);
+    setSubmittedOnce(false);
+    setTouchedFields({
+      amount: false,
+      note: false,
+      recipient: false,
+    });
+    setDraftPromptVisible(false);
+    clearDraft();
+  }, [clearDraft, showSuccessOverlay]);
+
+  const amountSuggestions = useMemo(() => {
+    const uniqueAmounts = new Set<string>();
+
+    for (const item of history) {
+      const normalized = normalizeAmount(item.amount);
+      if (!normalized) {
+        continue;
+      }
+
+      uniqueAmounts.add(normalized);
+      if (uniqueAmounts.size === 3) {
+        break;
+      }
+    }
+
+    return [...uniqueAmounts];
+  }, [history]);
+
+  const recipientIsValid = useMemo(
+    () => Boolean(formState.recipient.trim()) && isAddress(formState.recipient.trim()),
+    [formState.recipient],
+  );
+  const normalizedAmount = useMemo(() => normalizeAmount(formState.amount), [formState.amount]);
+  const amountValue = normalizedAmount ? Number(normalizedAmount) : Number.NaN;
+  const amountIsValid = Number.isFinite(amountValue) && amountValue > 0;
+  const isFirstTimeRecipient =
+    recipientIsValid &&
+    !hasRecipient(formState.recipient.trim()) &&
+    !contacts.some(
+      (contact) => contact.address.toLowerCase() === formState.recipient.trim().toLowerCase(),
+    );
+
+  const recipientError =
+    (submittedOnce || touchedFields.recipient) && !recipientIsValid
+      ? "That wallet address doesn't look right. Double-check it and try again."
+      : null;
+
+  const amountError =
+    (submittedOnce || touchedFields.amount) && !formState.amount.trim()
+      ? "Enter an amount to continue."
+      : (submittedOnce || touchedFields.amount) && !amountIsValid
+        ? "Enter a valid amount greater than zero."
+        : null;
+
+  const sameAddressWarning =
+    recipientIsValid &&
+    connectedAddress &&
+    formState.recipient.trim().toLowerCase() === connectedAddress.toLowerCase()
+      ? "You can't send a payment to your own wallet here."
+      : null;
+
+  const canReview = recipientIsValid && amountIsValid && !sameAddressWarning;
+  const canSubmit = canReview && !isSubmitting;
+  const statusMeta = getStatusClasses(txStage);
+
+  function updateField(field: keyof FormState, value: string) {
+    setFormState((current) => ({
+      ...current,
+      [field]: value,
+    }));
+
+    if (field !== "note") {
+      clearPaymentError();
+    }
   }
 
-  async function handleSubmit() {
-    if (reviewDisabled || !isAddress(recipient.trim())) {
+  function markTouched(field: keyof FormState) {
+    setTouchedFields((current) => ({
+      ...current,
+      [field]: true,
+    }));
+  }
+
+  function applyDraft() {
+    setFormState({
+      amount: draft.amount,
+      note: draft.note,
+      recipient: draft.recipient,
+    });
+    setDraftPromptVisible(false);
+  }
+
+  function dismissDraft() {
+    clearDraft();
+    setDraftPromptVisible(false);
+  }
+
+  function applyAmountSuggestion(amount: string) {
+    updateField("amount", amount);
+    markTouched("amount");
+  }
+
+  function applyRecipient(address: string, label?: string) {
+    updateField("recipient", address);
+    markTouched("recipient");
+    setRecipientName(label ?? "");
+    clearPaymentError();
+  }
+
+  function handleUseSuggestion() {
+    if (!noteSuggestion) {
+      return;
+    }
+
+    updateField("note", noteSuggestion);
+    markTouched("note");
+    setNoteSuggestion(null);
+  }
+
+  function goToReview() {
+    setSubmittedOnce(true);
+
+    if (!canReview) {
+      return;
+    }
+
+    setReviewMode(true);
+  }
+
+  async function confirmAndSend() {
+    setSubmittedOnce(true);
+
+    if (!canSubmit) {
       return;
     }
 
     await handlePay({
-      amount: amount.trim(),
-      note: note.trim() || undefined,
-      recipient: recipient.trim() as `0x${string}`,
-      recipientName: selectedContact?.name,
+      amount: normalizeAmount(formState.amount),
+      note: formState.note.trim() || undefined,
+      recipient: formState.recipient.trim() as `0x${string}`,
+      recipientName: recipientName || undefined,
     });
   }
 
-  function handleResetAfterSuccess() {
+  function startAnotherPayment() {
     resetSuccessState();
-    setRecipient("");
-    setAmount("");
-    setNote("");
-    setStep("form");
-    setHasTriedReview(false);
-    setHasTouchedRecipient(false);
-    setHasTouchedAmount(false);
+    clearPaymentError();
   }
 
-  function openNewContactEditor() {
-    setEditingContactId(null);
+  function resetContactEditor() {
     setContactName("");
-    setContactAddress(recipient.trim());
+    setContactAddress("");
     setContactEmoji(CONTACT_EMOJI_OPTIONS[0]);
-    setIsContactEditorOpen(true);
+    setEditingContactId(null);
+    setContactError(null);
   }
 
-  function openEditContactEditor(contact: SavedContact) {
+  function handleEditContact(contact: SavedContact) {
     setEditingContactId(contact.id);
     setContactName(contact.name);
     setContactAddress(contact.address);
     setContactEmoji(contact.emoji || CONTACT_EMOJI_OPTIONS[0]);
-    setIsContactEditorOpen(true);
+    setContactError(null);
   }
-
-  function closeContactEditor() {
-    setEditingContactId(null);
-    setContactName("");
-    setContactAddress("");
-    setContactEmoji(CONTACT_EMOJI_OPTIONS[0]);
-    setIsContactEditorOpen(false);
-  }
-
-  function handleSelectContact(contact: SavedContact) {
-    setRecipient(contact.address);
-    setHasTouchedRecipient(true);
-  }
-
-  const showRecipientError = Boolean(errors.recipient) && (hasTouchedRecipient || hasTriedReview);
-  const showAmountError = Boolean(errors.amount) && (hasTouchedAmount || hasTriedReview);
 
   function handleSaveContact() {
-    if (errors.contactAddress || errors.contactName || !isAddress(contactAddress.trim())) {
+    const trimmedName = contactName.trim();
+    const trimmedAddress = contactAddress.trim();
+
+    if (!trimmedName) {
+      setContactError("Add a name before saving this contact.");
       return;
     }
 
-    saveContact({
-      address: contactAddress.trim() as `0x${string}`,
-      emoji: contactEmoji,
-      id: editingContactId ?? createContactId(),
-      name: contactName.trim(),
-    });
-
-    if (!recipient.trim()) {
-      setRecipient(contactAddress.trim());
+    if (!isAddress(trimmedAddress)) {
+      setContactError("Enter a valid wallet address to save this contact.");
+      return;
     }
 
-    closeContactEditor();
+    if (hasDuplicateAddress(trimmedAddress, editingContactId ?? undefined)) {
+      setContactError("That address is already saved.");
+      return;
+    }
+
+    const contactId = editingContactId ?? `contact_${trimmedAddress.toLowerCase()}`;
+
+    saveContact({
+      address: trimmedAddress as `0x${string}`,
+      emoji: contactEmoji,
+      id: contactId,
+      name: trimmedName,
+    });
+
+    if (formState.recipient.trim().toLowerCase() === trimmedAddress.toLowerCase()) {
+      setRecipientName(trimmedName);
+    }
+
+    resetContactEditor();
   }
 
   return (
-    <section className="section-frame payflow-surface fade-up-soft stagger-2 relative overflow-hidden rounded-[1.45rem] p-3.5 sm:p-4">
-      <div className="absolute inset-x-0 top-0 h-20 bg-gradient-to-r from-cyan/16 via-violet/10 to-coral/14" />
-      <div className="absolute -left-12 top-8 h-24 w-24 rounded-full bg-cyan/16 blur-3xl" />
-      <div className="absolute bottom-0 right-0 h-32 w-32 rounded-full bg-violet/14 blur-3xl" />
-      <div className="relative z-10">
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
-          <div>
-            <p className="section-kicker text-cyan">Veero Pay</p>
-            <h2 className="section-title mt-2 text-[1.3rem] text-slate-900 sm:text-[1.45rem]">
-              Send money
-            </h2>
-            <p className="mt-1.5 max-w-lg text-[12px] leading-5 text-slate-500">
-              Fast, simple, and stablecoin-first
-            </p>
-          </div>
+    <section className="section-frame rounded-[1rem] p-2.5">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <p className="section-kicker text-cyan">Send</p>
+          <h2 className="mt-1 text-[1rem] font-semibold tracking-[-0.04em] text-slate-900">
+            Send money
+          </h2>
+          <p className="mt-1 text-[12px] text-slate-500">
+            Recipient, amount, then confirm.
+          </p>
         </div>
+        {activeProductId ? (
+          <p className="text-[11px] font-medium text-slate-400">USDC on Arc</p>
+        ) : null}
+      </div>
 
-        <div className="mt-3 grid gap-2.5 lg:grid-cols-[minmax(0,1.08fr)_250px]">
-          <div
-            className={`payflow-card fade-up-soft rounded-[1.35rem] bg-gradient-to-br from-white/90 via-violet/10 to-cyan/12 p-3.5 sm:p-4 ${
-              showPendingState ? "loading-shimmer payflow-card-pending" : ""
-            }`}
-          >
-            <div className="payflow-card-glow" />
-            {statusLabel ? (
-              <div>
-                <div className={`payflow-status payflow-status-${txStage}`} aria-live="polite">
-                  <span className="payflow-status-dot" />
-                  {statusLabel}
+      <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(0,1fr)_18rem]">
+        <div className="space-y-2.5">
+          {draftPromptVisible ? (
+            <div className="payflow-inline-state">
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <p className="text-[12px] font-semibold text-slate-900">Continue draft?</p>
+                  <p className="mt-1 text-[12px] text-slate-500">
+                    Your last recipient, amount, and note are still here.
+                  </p>
                 </div>
-                <p className="mt-2 text-[11px] text-slate-400">
-                  {txStage === "confirming" ? "Finalizing payment..." : "This usually only takes a moment."}
-                </p>
-              </div>
-            ) : null}
-
-            <div className="payflow-icon payflow-icon-small">$</div>
-
-            {step === "form" ? (
-              <div className="relative z-10">
-                <div className="mb-2.5 flex items-center gap-2 text-[10px] uppercase tracking-[0.16em] text-slate-400">
-                  <span className="rounded-full bg-slate-100 px-2 py-1 font-medium text-slate-600">
-                    1 Recipient
-                  </span>
-                  <span className="h-px flex-1 bg-slate-200" />
-                  <span className="rounded-full bg-slate-100 px-2 py-1">2 Amount</span>
-                  <span className="h-px flex-1 bg-slate-200" />
-                  <span className="rounded-full bg-slate-100 px-2 py-1">3 Review</span>
-                </div>
-
-                <div className="rounded-[1rem] border border-white/70 bg-white/78 px-3 py-3 shadow-[0_12px_26px_rgba(107,88,145,0.06)] sm:px-3.5">
-                  <div className="flex items-center justify-between gap-3">
-                    <div>
-                      <p className="meta-label">Your money, in view</p>
-                      <p className="mt-1 text-[1.4rem] font-semibold tracking-[-0.06em] text-slate-900 sm:text-[1.65rem]">
-                        {formatUsdcBalance(availableBalance, usdcDecimals)}
-                      </p>
-                    </div>
-                    <div className="rounded-full border border-slate-200/90 bg-slate-50/90 px-3 py-1.5 text-[10px] font-medium uppercase tracking-[0.18em] text-slate-500">
-                      USDC
-                    </div>
-                  </div>
-                </div>
-
-                <div className="mt-2.5">
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="meta-label">Recipient</p>
-                    <button
-                      type="button"
-                      onClick={selectedContact ? () => openEditContactEditor(selectedContact) : openNewContactEditor}
-                      className="text-[11px] font-semibold uppercase tracking-[0.16em] text-slate-500 transition hover:text-slate-900"
-                    >
-                      {selectedContact ? "Edit" : "Add contact"}
-                    </button>
-                  </div>
-                  <input
-                    value={recipient}
-                    onChange={(event) => {
-                      setRecipient(event.target.value);
-                      setHasTouchedRecipient(true);
-                    }}
-                    placeholder="Paste wallet address or choose a saved contact"
-                    disabled={isSubmitting}
-                    className="mt-1.5 w-full rounded-[0.85rem] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 outline-none transition focus:border-cyan/20 focus:ring-2 focus:ring-cyan/8 disabled:opacity-70"
-                  />
-                  {showRecipientError ? (
-                    <div className="payflow-state-error mt-2 rounded-[1rem] px-3 py-2 text-sm text-rose-700">
-                      {errors.recipient}
-                    </div>
-                  ) : null}
-                  {selectedContact ? (
-                    <div className="contact-active-shell mt-2.5 rounded-[0.95rem] border border-slate-200 bg-slate-50/85 px-3 py-2.5">
-                      <div className="flex items-center justify-between gap-3">
-                        <div className="flex min-w-0 items-center gap-3">
-                          <div className="flex h-9 w-9 items-center justify-center rounded-[0.9rem] bg-white/85 text-base shadow-[0_10px_22px_rgba(107,88,145,0.08)]">
-                            {selectedContact.emoji || "\u{1F642}"}
-                          </div>
-                          <div className="min-w-0">
-                            <p className="truncate text-sm font-semibold text-slate-900">
-                              Paying {selectedContact.name}
-                            </p>
-                            <p className="truncate text-xs text-slate-500">
-                              {selectedContact.address}
-                            </p>
-                          </div>
-                        </div>
-                        <span className="rounded-full bg-slate-100 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-slate-600">Saved</span>
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-
-                <div className="payflow-input-shell mt-2.5 rounded-[1rem] border border-white/70 bg-white/74 px-3 py-3 shadow-[0_12px_26px_rgba(107,88,145,0.06)] sm:px-3.5 sm:py-3.5">
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="meta-label">Amount</p>
-                    <span className="text-[11px] font-medium text-slate-400">USDC</span>
-                  </div>
-                  <div className="mt-2.5 flex items-end gap-3">
-                    <input
-                      value={amount}
-                      onChange={(event) => {
-                        setAmount(event.target.value);
-                        setHasTouchedAmount(true);
-                      }}
-                      placeholder="0.00"
-                      inputMode="decimal"
-                      disabled={isSubmitting}
-                      className="min-w-0 flex-1 bg-transparent text-[1.85rem] font-semibold tracking-[-0.08em] text-slate-900 outline-none placeholder:text-slate-300 sm:text-[2.15rem] disabled:opacity-70"
-                    />
-                    <span className="pb-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-400">
-                      USDC
-                    </span>
-                  </div>
-                  {showAmountError ? (
-                    <div className="payflow-state-error mt-3 rounded-[1rem] px-3 py-2 text-sm text-rose-700">
-                      {errors.amount}
-                    </div>
-                  ) : (
-                    <p className="mt-2.5 text-[12px] text-slate-400">
-                      {availableBalance === undefined ? "Loading balances..." : `Available balance: ${formatUsdcBalance(availableBalance, usdcDecimals)} USDC`}
-                    </p>
-                  )}
-                </div>
-
-                <div className="mt-2">
-                  <p className="meta-label">Add a note</p>
-                  <textarea
-                    value={note}
-                    onChange={(event) => setNote(event.target.value)}
-                    placeholder="What is this payment for?"
-                    rows={1}
-                    disabled={isSubmitting}
-                    className="mt-1.5 w-full resize-none rounded-[0.85rem] border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-900 outline-none transition focus:border-cyan/30 focus:ring-2 focus:ring-cyan/10 disabled:opacity-70"
-                  />
-                </div>
-
-                {paymentError ? (
-                  <div className="payflow-state-error mt-3 rounded-[1rem] border border-coral/20 bg-white px-4 py-3 text-sm text-rose-700">
-                    <p className="font-semibold text-slate-900">Payment failed</p>
-                    <p className="mt-1 text-sm text-rose-700">Something interrupted the payment. Nothing was sent.</p>
-                    <p className="mt-2 text-xs text-slate-600">{paymentError}</p>
-                    <p className="mt-1 text-xs text-slate-500">Check your wallet, network, and balance, then retry.</p>
-                    <div className="mt-3 flex flex-wrap gap-2">
-                      <button
-                        type="button"
-                        onClick={() => clearPaymentError()}
-                        className="action-pill action-primary"
-                      >
-                        Try again
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setStep("form")}
-                        className="action-pill action-secondary"
-                      >
-                        Go back
-                      </button>
-                    </div>
-                  </div>
-                ) : null}
-
-                {isWrongNetwork ? (
-                  <div className="payflow-state-warn mt-3 rounded-[1rem] border border-coral/20 bg-white px-4 py-3 text-sm text-slate-700">
-                    <p className="font-semibold text-slate-900">Wrong network</p>
-                    <p className="mt-1">Veero is built for Arc. Switch to see the right balances and payment flow.</p>
-                    <p className="mt-2 text-xs text-slate-500">Once you switch, everything updates automatically.</p>
-                  </div>
-                ) : null}
-
-                <div className="payflow-action-bar mt-3.5 flex flex-col gap-2 sm:flex-row sm:justify-end">
+                <div className="payflow-compact-actions shrink-0">
                   <button
-                    onClick={handleReview}
-                    disabled={reviewDisabled}
-                    className="action-pill action-primary payflow-button payflow-button-ripple disabled:cursor-not-allowed disabled:opacity-60"
+                    type="button"
+                    className="mini-chip"
+                    onClick={dismissDraft}
                   >
-                    {isSubmitting ? "Processing..." : "Review payment"}
+                    Clear
+                  </button>
+                  <button
+                    type="button"
+                    className="mini-chip mini-chip-active"
+                    onClick={applyDraft}
+                  >
+                    Continue
                   </button>
                 </div>
               </div>
-            ) : (
-              <div className="relative z-10">
-                <div className="rounded-[1rem] border border-white/70 bg-white/80 px-3.5 py-3.5 shadow-[0_12px_26px_rgba(107,88,145,0.06)] sm:px-4">
-                  <p className="meta-label">Review payment</p>
-                  <p className="mt-2 text-[1.7rem] font-semibold tracking-[-0.08em] text-slate-900 sm:text-[1.95rem]">
-                    {amount.trim()} <span className="text-slate-400">USDC</span>
-                  </p>
-                  <p className="mt-1.5 text-[13px] text-slate-500">
-                    Check the recipient and amount, then confirm.
-                  </p>
-                  <div className="soft-divider mt-4" />
-                </div>
+            </div>
+          ) : null}
 
-                <div className="mt-2.5 grid gap-2">
-                  <div className="rounded-[0.9rem] border border-slate-200 bg-white/75 px-3.5 py-3">
-                    <p className="meta-label">To</p>
-                    {selectedContact ? (
-                      <>
-                        <p className="mt-2 text-base font-semibold text-slate-900">
-                          {selectedContact.emoji ? `${selectedContact.emoji} ` : ""}
-                          {selectedContact.name}
-                        </p>
-                        <p className="mt-1 break-all text-[12px] text-slate-400">
-                          {selectedContact.address}
-                        </p>
-                      </>
-                    ) : (
-                      <p className="mt-2 break-all text-base font-medium text-slate-900">
-                        {recipient.trim()}
-                      </p>
-                    )}
-                  </div>
-                  <div className="rounded-[0.9rem] border border-slate-200 bg-white/75 px-3.5 py-3">
-                    <p className="meta-label">Amount</p>
-                    <p className="mt-2 text-lg font-semibold tracking-[-0.05em] text-slate-900">{amount.trim()} USDC</p>
-                  </div>
-                  <div className="rounded-[0.9rem] border border-slate-200 bg-white/75 px-3.5 py-2.5">
-                    <p className="meta-label">Network</p>
-                    <p className="mt-2 text-[13px] font-medium text-slate-700">
-                      Arc Testnet
-                    </p>
-                    {estimatedRemainingBalance !== null ? (
-                      <p className="mt-1 text-[11px] text-slate-400">
-                        {formatUsdcBalance(estimatedRemainingBalance, usdcDecimals)} USDC after this payment
-                      </p>
-                    ) : null}
-                  </div>
-                  {note.trim() ? (
-                    <div className="rounded-[0.9rem] border border-slate-200 bg-white/75 px-3.5 py-2.5">
-                      <p className="meta-label">Note</p>
-                      <p className="mt-2 text-sm leading-6 text-slate-700">{note.trim()}</p>
+          {recentsReady && recipients.length > 0 ? (
+            <div className="compact-line-block">
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-[11px] font-medium uppercase tracking-[0.16em] text-slate-400">
+                  Recent
+                </p>
+                <p className="text-[11px] text-slate-400">Tap to reuse</p>
+              </div>
+              <div className="recent-contact-row mt-2">
+                {recipients.map((recipient) => (
+                  <button
+                    key={recipient.id}
+                    type="button"
+                    className="recent-contact-chip"
+                    onClick={() => applyRecipient(recipient.address, recipient.label)}
+                  >
+                    <span className="recent-contact-avatar">
+                      {(recipient.label || recipient.address).slice(0, 1).toUpperCase()}
+                    </span>
+                    <span className="truncate">
+                      {recipient.label || shortAddress(recipient.address)}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
+
+          <div className="space-y-2">
+            <div>
+              <label className="text-[11px] font-medium uppercase tracking-[0.16em] text-slate-400">
+                Recipient
+              </label>
+              <div className="mt-1">
+                <input
+                  value={formState.recipient}
+                  onChange={(event) => updateField("recipient", event.target.value)}
+                  onBlur={() => markTouched("recipient")}
+                  placeholder="Paste wallet address"
+                  className="payflow-compact-input"
+                />
+              </div>
+              {recipientError ? (
+                <p className="mt-1 text-[12px] text-rose-600">{recipientError}</p>
+              ) : null}
+            </div>
+
+            <div>
+              <div className="flex items-center justify-between gap-3">
+                <label className="text-[11px] font-medium uppercase tracking-[0.16em] text-slate-400">
+                  Amount
+                </label>
+                <span className="text-[11px] text-slate-400">USDC</span>
+              </div>
+              <div className="amount-input-row mt-1">
+                <input
+                  value={formState.amount}
+                  onChange={(event) => updateField("amount", event.target.value)}
+                  onBlur={() => markTouched("amount")}
+                  inputMode="decimal"
+                  placeholder="0.00"
+                  className="amount-input"
+                />
+                <span className="text-[12px] font-medium text-slate-400">USDC</span>
+              </div>
+              {amountSuggestions.length > 0 ? (
+                <div className="inline-chip-row mt-2">
+                  {amountSuggestions.map((amount) => (
+                    <button
+                      key={amount}
+                      type="button"
+                      className={`mini-chip ${
+                        normalizeAmount(formState.amount) === amount ? "mini-chip-active" : ""
+                      }`}
+                      onClick={() => applyAmountSuggestion(amount)}
+                    >
+                      {amount}
+                    </button>
+                  ))}
+                </div>
+              ) : null}
+              {amountError ? <p className="mt-1 text-[12px] text-rose-600">{amountError}</p> : null}
+            </div>
+
+            <div>
+              <label className="text-[11px] font-medium uppercase tracking-[0.16em] text-slate-400">
+                Note
+              </label>
+              <textarea
+                value={formState.note}
+                onChange={(event) => updateField("note", event.target.value)}
+                onBlur={() => markTouched("note")}
+                placeholder="What is this payment for?"
+                className="payflow-compact-input payflow-note-input mt-1"
+              />
+              {noteSuggestion || noteSuggestionLoading ? (
+                <div className="inline-chip-row mt-2">
+                  <span className="text-[11px] text-slate-400">Suggested</span>
+                  {noteSuggestionLoading ? (
+                    <span className="mini-chip">Checking...</span>
+                  ) : (
+                    <button
+                      type="button"
+                      className="mini-chip mini-chip-active"
+                      onClick={handleUseSuggestion}
+                    >
+                      {noteSuggestion}
+                    </button>
+                  )}
+                </div>
+              ) : null}
+            </div>
+          </div>
+
+          {isFirstTimeRecipient ? (
+            <div className="payflow-inline-warning">
+              First time sending to this address.
+            </div>
+          ) : null}
+
+          {sameAddressWarning ? (
+            <div className="payflow-inline-warning payflow-inline-warning-error">
+              {sameAddressWarning}
+            </div>
+          ) : null}
+
+          {statusLabel ? (
+            <div className={statusMeta.shellClass}>
+              <div className="flex items-center gap-2">
+                <span className={statusMeta.dotClass} />
+                <div>
+                  <p className="text-[12px] font-semibold text-slate-900">{statusLabel}</p>
+                  <p className="text-[11px] text-slate-500">This usually only takes a moment.</p>
+                  {shortHash ? (
+                    <div className="mt-1 flex flex-wrap items-center gap-2 text-[11px] text-slate-500">
+                      <span>Tx: {shortHash}</span>
+                      {explorerHref ? (
+                        <a
+                          href={explorerHref}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="font-medium text-slate-700 underline decoration-slate-300 underline-offset-4"
+                        >
+                          View on explorer
+                        </a>
+                      ) : null}
                     </div>
                   ) : null}
+                  {isConfirmationDelayed && submittedHash ? (
+                    <p className="mt-1 text-[11px] text-amber-700">
+                      Confirmation is taking longer than usual. The transaction may still be pending.
+                    </p>
+                  ) : null}
                 </div>
+              </div>
+            </div>
+          ) : null}
 
-                {paymentError ? (
-                  <div className="payflow-state-error mt-3 rounded-[1rem] border border-coral/20 bg-white px-4 py-3 text-sm text-rose-700">
-                    <p className="font-semibold text-slate-900">Payment failed</p>
-                    <p className="mt-1 text-sm text-rose-700">Something interrupted the payment. Nothing was sent.</p>
-                    <p className="mt-2 text-xs text-slate-600">{paymentError}</p>
-                    <p className="mt-1 text-xs text-slate-500">Check your wallet, network, and balance, then retry.</p>
-                    <div className="mt-3 flex flex-wrap gap-2">
+          {paymentError ? (
+            <div className="payflow-inline-warning payflow-inline-warning-error">
+              {paymentError}
+            </div>
+          ) : null}
+
+          {showSuccessOverlay && successAmount && successRecipient ? (
+            <div className="payflow-inline-state payflow-inline-success">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0">
+                  <p className="text-[12px] font-semibold text-slate-900">Payment confirmed</p>
+                  <p className="mt-1 text-[12px] text-slate-500">
+                    {successAmount} USDC to{" "}
+                    {successRecipientName || shortAddress(successRecipient)}
+                  </p>
+                  {successNote ? (
+                    <p className="mt-1 text-[12px] text-slate-500">Note: {successNote}</p>
+                  ) : null}
+                  {shortHash ? (
+                    <p className="mt-1 text-[11px] text-slate-400">Tx: {shortHash}</p>
+                  ) : null}
+                </div>
+                <div className="payflow-compact-actions shrink-0">
+                  {explorerHref ? (
+                    <a
+                      href={explorerHref}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="mini-chip"
+                    >
+                      Explorer
+                    </a>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="mini-chip mini-chip-active"
+                    onClick={startAnotherPayment}
+                  >
+                    Send another
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : null}
+
+          {reviewMode ? (
+            <div className="payflow-inline-state">
+              <p className="text-[12px] font-semibold text-slate-900">Review payment</p>
+              <p className="mt-1 text-[12px] text-slate-500">
+                Confirm the address and amount before sending on Arc.
+              </p>
+
+              <div className="mt-2">
+                <div className="review-line">
+                  <span className="text-[11px] uppercase tracking-[0.16em] text-slate-400">To</span>
+                  <span className="text-right text-[12px] font-medium text-slate-900">
+                    {recipientName || shortAddress(formState.recipient.trim())}
+                  </span>
+                </div>
+                <div className="review-line">
+                  <span className="text-[11px] uppercase tracking-[0.16em] text-slate-400">
+                    Amount
+                  </span>
+                  <span className="text-right text-[13px] font-semibold text-slate-900">
+                    {normalizeAmount(formState.amount)} USDC
+                  </span>
+                </div>
+                <div className="review-line review-line-note">
+                  <span className="text-[11px] uppercase tracking-[0.16em] text-slate-400">Note</span>
+                  <span className="text-right text-[12px] text-slate-600">
+                    {formState.note.trim() || "No note"}
+                  </span>
+                </div>
+                <div className="review-line">
+                  <span className="text-[11px] uppercase tracking-[0.16em] text-slate-400">
+                    Network
+                  </span>
+                  <span className="text-right text-[12px] font-medium text-slate-900">
+                    {arcTestnet.name}
+                  </span>
+                </div>
+              </div>
+
+              <div className="payflow-action-bar">
+                <div className="payflow-compact-actions">
+                  <button
+                    type="button"
+                    className="action-pill action-secondary"
+                    onClick={() => setReviewMode(false)}
+                  >
+                    Back
+                  </button>
+                  <button
+                    type="button"
+                    className="action-pill action-primary"
+                    onClick={() => void confirmAndSend()}
+                    disabled={!canSubmit}
+                  >
+                    {isSubmitting ? "Sending..." : "Confirm and send"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="payflow-action-bar">
+              <div className="payflow-compact-actions">
+                <button
+                  type="button"
+                  className="action-pill action-secondary"
+                  onClick={() => {
+                    setFormState(EMPTY_FORM);
+                    setRecipientName("");
+                    setSubmittedOnce(false);
+                    setTouchedFields({
+                      amount: false,
+                      note: false,
+                      recipient: false,
+                    });
+                    clearDraft();
+                    clearPaymentError();
+                  }}
+                >
+                  Clear
+                </button>
+                <button
+                  type="button"
+                  className="action-pill action-primary"
+                  onClick={goToReview}
+                >
+                  Review payment
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div className="space-y-2.5">
+          <div className="compact-line-block">
+            <div className="flex items-center justify-between gap-3">
+              <p className="text-[11px] font-medium uppercase tracking-[0.16em] text-slate-400">
+                Saved contacts
+              </p>
+              <p className="text-[11px] text-slate-400">
+                {contactsReady ? `${contacts.length} saved` : "Loading..."}
+              </p>
+            </div>
+
+            {contactsReady && contacts.length > 0 ? (
+              <div className="compact-contact-list mt-2">
+                {contacts.map((contact) => (
+                  <div key={contact.id} className="compact-contact-row">
+                    <div className="flex min-w-0 items-center gap-2">
+                      <span className="compact-contact-avatar">
+                        {contact.emoji || contact.name.slice(0, 1).toUpperCase()}
+                      </span>
+                      <div className="min-w-0">
+                        <p className="truncate text-[12px] font-semibold text-slate-900">
+                          {contact.name}
+                        </p>
+                        <p className="truncate text-[11px] text-slate-400">
+                          {shortAddress(contact.address)}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="inline-chip-row">
                       <button
                         type="button"
-                        onClick={() => void handleSubmit()}
-                        className="action-pill action-primary"
+                        className="mini-chip mini-chip-active"
+                        onClick={() => applyRecipient(contact.address, contact.name)}
                       >
-                        Try again
+                        Pay
                       </button>
                       <button
                         type="button"
-                        onClick={() => {
-                          clearPaymentError();
-                          setStep("form");
-                        }}
-                        className="action-pill action-secondary"
+                        className="mini-chip"
+                        onClick={() => handleEditContact(contact)}
                       >
-                        Go back
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        className="mini-chip"
+                        onClick={() => removeContact(contact.id)}
+                      >
+                        Delete
                       </button>
                     </div>
                   </div>
-                ) : null}
+                ))}
+              </div>
+            ) : contactsReady ? (
+              <p className="mt-2 text-[12px] text-slate-500">
+                Save frequent recipients here for faster repeat payments.
+              </p>
+            ) : null}
+          </div>
 
-                <div className="payflow-action-bar mt-3.5 flex flex-col gap-2 sm:flex-row sm:justify-end">
+          <div className="compact-line-block">
+            <p className="text-[11px] font-medium uppercase tracking-[0.16em] text-slate-400">
+              {editingContactId ? "Edit contact" : "Add contact"}
+            </p>
+
+            <div className="mt-2 space-y-2">
+              <input
+                value={contactName}
+                onChange={(event) => setContactName(event.target.value)}
+                placeholder="Name"
+                className="payflow-compact-input"
+              />
+              <input
+                value={contactAddress}
+                onChange={(event) => setContactAddress(event.target.value)}
+                placeholder="Wallet address"
+                className="payflow-compact-input"
+              />
+              <div className="inline-chip-row">
+                {CONTACT_EMOJI_OPTIONS.map((emoji) => (
                   <button
-                    onClick={() => setStep("form")}
-                    disabled={isSubmitting}
-                    className="action-pill action-secondary payflow-button payflow-button-ripple disabled:cursor-not-allowed disabled:opacity-60"
+                    key={emoji}
+                    type="button"
+                    className={`mini-chip ${contactEmoji === emoji ? "mini-chip-active" : ""}`}
+                    onClick={() => setContactEmoji(emoji)}
+                  >
+                    {emoji}
+                  </button>
+                ))}
+              </div>
+              {contactError ? <p className="text-[12px] text-rose-600">{contactError}</p> : null}
+              <div className="payflow-compact-actions">
+                {editingContactId ? (
+                  <button
+                    type="button"
+                    className="action-pill action-secondary"
+                    onClick={resetContactEditor}
                   >
                     Cancel
                   </button>
-                  <button
-                    onClick={() => void handleSubmit()}
-                    disabled={isSubmitting}
-                    className="action-pill action-primary payflow-button payflow-button-ripple disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {isSubmitting ? "Confirming..." : "Confirm and send"}
-                  </button>
-                </div>
+                ) : null}
+                <button
+                  type="button"
+                  className="action-pill action-primary"
+                  onClick={handleSaveContact}
+                >
+                  {editingContactId ? "Update contact" : "Save contact"}
+                </button>
               </div>
-            )}
+            </div>
           </div>
 
-          <aside className="grid gap-2.5">
-            {isContactEditorOpen ? (
-              <div className="panel rounded-[1rem] bg-white/82 p-3 sm:p-3.5">
-                <div className="relative z-10">
-                  <div className="flex items-center justify-between gap-3">
-                    <p className="meta-label">Saved contacts</p>
-                    <button
-                      type="button"
-                      onClick={closeContactEditor}
-                      className="text-xs font-semibold uppercase tracking-[0.14em] text-slate-500 transition hover:text-slate-900"
-                    >
-                      Close
-                    </button>
-                  </div>
-
-                  <div className="mt-3">
-                    <p className="meta-label">Name</p>
-                    <input
-                      value={contactName}
-                      onChange={(event) => setContactName(event.target.value)}
-                      placeholder="e.g. Tobi"
-                      className="mt-2 w-full rounded-[0.85rem] border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-900 outline-none transition focus:border-cyan/30 focus:ring-2 focus:ring-cyan/10"
-                    />
-                    {errors.contactName ? (
-                      <div className="payflow-state-error mt-2 rounded-[1rem] px-3 py-2 text-sm text-rose-700">
-                        {errors.contactName}
-                      </div>
-                    ) : null}
-                  </div>
-
-                  <div className="mt-3">
-                    <p className="meta-label">Wallet address</p>
-                    <input
-                      value={contactAddress}
-                      onChange={(event) => setContactAddress(event.target.value)}
-                      placeholder="Paste wallet address"
-                      className="mt-2 w-full rounded-[0.85rem] border border-slate-200 bg-white px-4 py-2.5 text-sm text-slate-900 outline-none transition focus:border-cyan/30 focus:ring-2 focus:ring-cyan/10"
-                    />
-                    {errors.contactAddress ? (
-                      <div className="payflow-state-error mt-2 rounded-[1rem] px-3 py-2 text-sm text-rose-700">
-                        {errors.contactAddress}
-                      </div>
-                    ) : null}
-                  </div>
-
-                  <div className="mt-3">
-                    <p className="meta-label">Emoji or icon</p>
-                    <div className="mt-2 flex flex-wrap gap-2">
-                      {CONTACT_EMOJI_OPTIONS.map((emoji) => (
-                        <button
-                          key={emoji}
-                          type="button"
-                          onClick={() => setContactEmoji(emoji)}
-                          className={`flex h-10 w-10 items-center justify-center rounded-[0.9rem] border text-base transition ${
-                            contactEmoji === emoji
-                              ? "border-cyan/40 bg-gradient-to-br from-cyan/12 to-violet/10"
-                              : "border-white/80 bg-white/72"
-                          }`}
-                        >
-                          {emoji}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="mt-4 flex flex-col gap-2.5">
-                    <button
-                      type="button"
-                      onClick={handleSaveContact}
-                      className="action-pill action-primary payflow-button payflow-button-ripple"
-                    >
-                      Save contact
-                    </button>
-                  </div>
-                </div>
-              </div>
-            ) : null}
-
-            <div className="panel rounded-[1rem] bg-white/82 p-3 sm:p-3.5">
-              <div className="relative z-10">
-                <div className="flex items-end justify-between gap-3">
-                  <div>
-                    <p className="meta-label">Saved contacts</p>
-                    <p className="mt-1 text-[12px] text-slate-500">
-                      Tap a contact to fill the recipient.
-                    </p>
-                  </div>
-                  <span className="text-[11px] text-slate-400">{contacts.length} saved</span>
-                </div>
-
-                {!areContactsReady ? (
-                  <div className="payflow-state-empty mt-2 rounded-[1rem] border border-dashed border-slate-200 bg-white/70 px-3 py-2.5 text-sm text-slate-600">
-                    Loading contacts...
-                  </div>
-                ) : null}
-
-                {areContactsReady && contacts.length === 0 ? (
-                  <div className="payflow-state-empty mt-2 rounded-[1rem] border border-dashed border-slate-200 bg-white/70 px-3 py-2.5 text-sm text-slate-600">
-                    <p className="font-semibold text-slate-900">No contacts yet</p>
-                    <p className="mt-1">Save someone once, then pay them faster next time.</p>
-                  </div>
-                ) : null}
-
-                {contacts.length > 0 ? (
-                  <div className="mt-2 grid gap-2 max-h-[220px] overflow-auto pr-1">
-                    {contacts.map((contact) => (
-                      <div
-                        key={contact.id}
-                        className="contact-row flex items-center justify-between gap-2 rounded-[0.9rem] border border-slate-200 bg-white/72 px-2.5 py-2"
-                      >
-                        <button
-                          type="button"
-                          onClick={() => handleSelectContact(contact)}
-                          className="flex min-w-0 flex-1 items-center gap-2.5 text-left"
-                        >
-                          <div className="flex h-7 w-7 items-center justify-center rounded-[0.7rem] bg-slate-100 text-sm">
-                            {contact.emoji || "\u{1F642}"}
-                          </div>
-                          <div className="min-w-0">
-                            <p className="truncate text-sm font-semibold text-slate-900">
-                              {contact.name}
-                            </p>
-                            <p className="truncate text-[11px] text-slate-400">
-                              {shortAddress(contact.address)}
-                            </p>
-                          </div>
-                        </button>
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => openEditContactEditor(contact)}
-                            className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.14em] text-slate-600 transition hover:text-slate-900"
-                          >
-                            Edit
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => removeContact(contact.id)}
-                            className="rounded-full border border-slate-200 bg-white px-2.5 py-1 text-[10px] font-medium uppercase tracking-[0.14em] text-rose-600 transition hover:text-rose-700"
-                          >
-                            Delete
-                          </button>
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                ) : null}
-              </div>
+          {isWrongNetwork ? (
+            <div className="payflow-inline-warning">
+              Wrong network. Veero will switch to Arc before sending.
             </div>
-
-            <div className="panel rounded-[1rem] bg-white/82 p-3 sm:p-3.5">
-              <div className="relative z-10">
-                <p className="meta-label">Wallet</p>
-                <p className="mt-2.5 text-base font-semibold tracking-[-0.05em] text-slate-900">
-                  {isConnected ? shortAddress(address) : "Getting Veero ready..."}
-                </p>
-                <p className="mt-1.5 text-sm text-slate-600">
-                  {isArcTestnet ? "Works best on Arc Testnet for now." : "Switch to Arc to send with the right setup."}
-                </p>
-              </div>
-            </div>
-
-            <div className="panel rounded-[1rem] bg-white/82 p-3 sm:p-3.5">
-              <div className="relative z-10">
-                <p className="meta-label">Available balance</p>
-                <p className="mt-2.5 text-[1.55rem] font-semibold tracking-[-0.07em] text-slate-900">
-                  {formatUsdcBalance(availableBalance, usdcDecimals)}
-                </p>
-                <p className="mt-1.5 text-sm text-slate-600">See what you can spend at a glance.</p>
-              </div>
-            </div>
-
-              <div className="panel rounded-[1rem] bg-white/82 p-3 sm:p-3.5">
-                <div className="relative z-10">
-                <p className="meta-label">Veero</p>
-                  <div className="mt-2.5 space-y-2 text-sm text-slate-700">
-                    <p>Send and track stablecoin payments in one calm, simple view.</p>
-                  </div>
-                </div>
-              </div>
-          </aside>
+          ) : null}
         </div>
       </div>
-
-      {showSuccessOverlay ? (
-        <div className="payflow-success-overlay" aria-live="polite">
-          <div className="payflow-success-shell payflow-success" role="status">
-            <div className="payflow-success-burst payflow-success-burst-a" />
-            <div className="payflow-success-burst payflow-success-burst-b" />
-
-            <div className="payflow-success-mark payflow-coin-pulse">
-              <div className="payflow-success-ring" />
-              <svg
-                viewBox="0 0 52 52"
-                aria-hidden="true"
-                className="payflow-success-check"
-              >
-                <path
-                  d="M14 27.5 22.5 36 38 18.5"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="5"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                />
-              </svg>
-            </div>
-
-            <div className="relative z-10 text-center">
-              <p className="section-kicker text-cyan">Veero Pay</p>
-              <h3 className="mt-4 text-[2rem] font-semibold tracking-[-0.06em] text-slate-900 sm:text-[2.5rem]">
-                Payment sent
-              </h3>
-              <p className="mt-3 text-sm text-slate-600 sm:text-base">
-                Your USDC payment was sent on Arc.
-              </p>
-              <p className="mt-2 text-sm font-medium text-slate-500">Nice. That felt smooth.</p>
-            </div>
-
-            <div className="relative z-10 mt-7 grid gap-3 sm:grid-cols-2">
-              <div className="payflow-success-stat">
-                <span className="meta-label">Amount</span>
-                <strong>{successAmount} USDC</strong>
-              </div>
-              <div className="payflow-success-stat">
-                <span className="meta-label">Recipient</span>
-                <strong>
-                  {successRecipientName || shortAddress(successRecipient)}
-                </strong>
-                {successRecipientName && successRecipient ? (
-                  <span className="mt-1 block text-xs font-medium text-slate-500">
-                    {successRecipient}
-                  </span>
-                ) : null}
-              </div>
-              {successNote ? (
-                <div className="payflow-success-stat sm:col-span-2">
-                  <span className="meta-label">Note</span>
-                  <strong>{successNote}</strong>
-                </div>
-              ) : null}
-              <div className="payflow-success-stat sm:col-span-2">
-                <span className="meta-label">Transaction</span>
-                <strong>{shortHash}</strong>
-              </div>
-            </div>
-
-            <div className="relative z-10 mt-6 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-center">
-              {explorerHref ? (
-                <a
-                  href={explorerHref}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="action-pill action-secondary payflow-success-link payflow-button-ripple"
-                >
-                  Open in explorer
-                </a>
-              ) : null}
-              <a href="#activity" className="action-pill action-secondary payflow-button-ripple">
-                View activity
-              </a>
-              <button
-                onClick={handleResetAfterSuccess}
-                className="action-pill action-primary payflow-button-ripple"
-              >
-                Send another payment
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
     </section>
   );
 }

@@ -1,10 +1,25 @@
+import dynamic from "next/dynamic";
 import { BalanceOverview } from "@/components/balance-overview";
 import { ConnectWalletButton } from "@/components/connect-wallet-button";
 import { NetworkStatusCard } from "@/components/network-status-card";
 import { PayflowSection } from "@/components/payflow-section";
-import { PaymentHistorySection } from "@/components/payment-history-section";
 import { QuickLinkCard } from "@/components/quick-link-card";
 import { VeeroInsightsSection } from "@/components/veero-insights-section";
+
+const PaymentHistorySection = dynamic(
+  () =>
+    import("@/components/payment-history-section").then(
+      (module) => module.PaymentHistorySection,
+    ),
+  {
+    loading: () => (
+      <section className="section-frame rounded-[1rem] p-2.5">
+        <p className="section-kicker text-cyan">Activity</p>
+        <p className="mt-2 text-[12px] text-slate-500">Loading activity...</p>
+      </section>
+    ),
+  },
+);
 
 const links = [
   {

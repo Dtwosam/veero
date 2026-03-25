@@ -1,4 +1,10 @@
-export type TxStage = "preparing" | "wallet" | "confirming" | "success" | null;
+export type TxStage =
+  | "preparing"
+  | "wallet"
+  | "confirming"
+  | "success"
+  | "failed"
+  | null;
 
 export type SendPaymentInput = {
   amount: string;
@@ -14,6 +20,20 @@ export type SavedContact = {
   id: string;
   name: string;
   address: `0x${string}`;
+};
+
+export type RecentRecipient = {
+  id: string;
+  address: `0x${string}`;
+  label?: string;
+  lastPaidAt: string;
+};
+
+export type PaymentDraft = {
+  recipient: string;
+  amount: string;
+  note: string;
+  updatedAt: string;
 };
 
 export type PaymentHistoryEntry = {
