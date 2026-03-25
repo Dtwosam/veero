@@ -163,6 +163,15 @@ export function PayflowSection() {
       return;
     }
 
+    if (
+      draftPromptVisible &&
+      !formState.amount.trim() &&
+      !formState.note.trim() &&
+      !formState.recipient.trim()
+    ) {
+      return;
+    }
+
     const timeoutId = window.setTimeout(() => {
       const nextDraft = {
         amount: formState.amount.trim(),
